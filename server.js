@@ -156,6 +156,8 @@ app.post("/instagram-info", (req, res) => {
       "--no-warnings",
       "--no-playlist",
       "--no-download",
+      "--format",
+      "best[acodec!=none][vcodec!=none]",
       "--",
       parsed.href
     ],
@@ -165,31 +167,56 @@ app.post("/instagram-info", (req, res) => {
     },
     (error, stdout, stderr) => {
       if (error) {
-        console.error("Instagram extraction failed:", stderr || error.message);
+        console.error(
+          "Instagram extraction failed:",
+          stderr || error.message
+        );
 
         return res.status(502).json({
           success: false,
           message:
-            "Instagram could not provide this media. The post may be private, login-restricted, or temporarily unavailable."
+            "Instagram could not provide a video with both audio and video. The post may be private, login-restricted, or unavailable."
         });
       }
 
       try {
         const info = JSON.parse(stdout);
 
-        const formats = Array.isArray(info.formats) ? info.formats : [];
-        const videoFormats = formats
-          .filter(f => f.url && f.vcodec && f.vcodec !== "none")
-          .sort((a, b) => (b.height || 0) - (a.height || 0));
+        const formats = Array.isArray(info.formats)
+          ? info.formats
+          : [];
 
-        const chosen = videoFormats[0] || (
-          info.url && info.vcodec !== "none" ? info : null
-        );
+        const combinedFormats = formats
+          .filter(f =>
+            f.url &&
+            f.vcodec &&
+            f.vcodec !== "none" &&
+            f.acodec &&
+            f.acodec !== "none"
+          )
+          .sort((a, b) => {
+            return (
+              (b.height || 0) - (a.height || 0) ||
+              (b.tbr || 0) - (a.tbr || 0)
+            );
+          });
+
+        const infoHasAudio =
+          info.url &&
+          info.vcodec &&
+          info.vcodec !== "none" &&
+          info.acodec &&
+          info.acodec !== "none";
+
+        const chosen = infoHasAudio
+          ? info
+          : combinedFormats[0];
 
         if (!chosen || !chosen.url) {
           return res.status(502).json({
             success: false,
-            message: "No downloadable video format was returned."
+            message:
+              "No video format containing both audio and video was found."
           });
         }
 
@@ -200,9 +227,13 @@ app.post("/instagram-info", (req, res) => {
           thumbnail: info.thumbnail || null,
           downloadUrl: chosen.url,
           extension: chosen.ext || "mp4",
-          message: "Video information extracted successfully."
+          hasAudio: true,
+          hasVideo: true,
+          message: "Audio and video stream extracted successfully."
         });
-      } catch {
+      } catch (parseError) {
+        console.error("Instagram JSON parsing failed:", parseError);
+
         return res.status(502).json({
           success: false,
           message: "The extraction service returned an unreadable response."
