@@ -3,332 +3,354 @@ import cors from "cors";
 import { execFile } from "node:child_process";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "1mb" }));
 
-const videoExtensions = [".mp4", ".mov", ".m4v", ".webm"];
-const audioExtensions = [".mp3", ".m4a", ".aac", ".wav", ".ogg"];
+const COOLDOWN_MS = 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 120000;
 
-const INSTAGRAM_COOLDOWN_MS = 5 * 60 * 1000;
-let instagramCooldownUntil = 0;
-let instagramRequestRunning = false;
+const platformCooldowns = new Map();
+const activeRequests = new Set();
 
-function getPlatform(url) {
-  const host = url.hostname.toLowerCase().replace(/^www\./, "");
+function detectPlatform(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const host = url.hostname.toLowerCase().replace(/^www\./, "");
 
-  if (["instagram.com", "instagr.am"].includes(host)) {
-    return "instagram";
+    if (
+      host === "youtube.com" ||
+      host === "m.youtube.com" ||
+      host === "youtu.be" ||
+      host === "music.youtube.com"
+    ) {
+      return "youtube";
+    }
+
+    if (
+      host === "facebook.com" ||
+      host === "m.facebook.com" ||
+      host === "fb.watch" ||
+      host === "web.facebook.com"
+    ) {
+      return "facebook";
+    }
+
+    if (
+      host === "instagram.com" ||
+      host === "instagr.am"
+    ) {
+      return "instagram";
+    }
+
+    return "direct";
+  } catch {
+    return null;
   }
-
-  if (
-    ["facebook.com", "m.facebook.com", "web.facebook.com", "fb.watch"].includes(host)
-  ) {
-    return "facebook";
-  }
-
-  if (
-    ["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(host)
-  ) {
-    return "youtube";
-  }
-
-  return "direct";
 }
 
-function isValidHttpUrl(value) {
+function isValidUrl(rawUrl) {
   try {
-    const url = new URL(value);
-
-    return (
-      ["http:", "https:"].includes(url.protocol) &&
-      !!url.hostname &&
-      !url.username &&
-      !url.password
-    );
+    const url = new URL(rawUrl);
+    return url.protocol === "http:" || url.protocol === "https:";
   } catch {
     return false;
   }
 }
 
-function hasVideo(format) {
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "python3",
+      ["-m", "yt_dlp", ...args],
+      {
+        timeout: REQUEST_TIMEOUT_MS,
+        maxBuffer: 15 * 1024 * 1024,
+        windowsHide: true
+      },
+      (error, stdout, stderr) => {
+        if (error) {
+          const message = stderr || error.message || "Extraction failed";
+          reject(new Error(message));
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          reject(new Error("Unable to read video information."));
+        }
+      }
+    );
+  });
+}
+
+function getErrorMessage(error) {
+  return String(error?.message || error || "Unknown error");
+}
+
+function isRateLimited(message) {
   return (
-    format &&
-    format.url &&
-    format.vcodec &&
-    format.vcodec !== "none"
+    /429|too many requests|rate.?limit|rate.?limited/i.test(message)
   );
 }
 
-function hasAudio(format) {
-  return (
-    format &&
-    format.url &&
-    format.acodec &&
-    format.acodec !== "none"
-  );
+function getHeaders(info) {
+  return info?.http_headers || {};
 }
 
-function getHeaders(format, info) {
-  return format?.http_headers || info?.http_headers || {};
+function getStream(format) {
+  if (!format?.url) return null;
+
+  return {
+    url: format.url,
+    headers: format.http_headers || {}
+  };
+}
+
+function getMediaResult(info, platform) {
+  const requestedFormats = info.requested_formats || [];
+
+  let videoFormat = null;
+  let audioFormat = null;
+  let combinedFormat = null;
+
+  if (requestedFormats.length >= 2) {
+    videoFormat = requestedFormats.find(
+      (format) => format.vcodec && format.vcodec !== "none"
+    );
+
+    audioFormat = requestedFormats.find(
+      (format) => format.acodec && format.acodec !== "none"
+    );
+  }
+
+  if (requestedFormats.length === 1) {
+    combinedFormat = requestedFormats[0];
+  }
+
+  if (!combinedFormat && !videoFormat) {
+    const formats = info.formats || [];
+
+    combinedFormat =
+      formats.find(
+        (format) =>
+          format.url &&
+          format.vcodec !== "none" &&
+          format.acodec !== "none"
+      ) || null;
+  }
+
+  if (!combinedFormat && !videoFormat) {
+    const directUrl = info.url;
+
+    if (directUrl) {
+      combinedFormat = {
+        url: directUrl,
+        http_headers: getHeaders(info),
+        vcodec: info.vcodec,
+        acodec: info.acodec
+      };
+    }
+  }
+
+  const videoStream = getStream(videoFormat);
+  const audioStream = getStream(audioFormat);
+  const combinedStream = getStream(combinedFormat);
+
+  let mode = "combined";
+
+  if (videoStream && audioStream) {
+    mode = "separate";
+  } else if (!combinedStream) {
+    throw new Error("No downloadable video format was found.");
+  }
+
+  return {
+    success: true,
+    platform,
+    title: info.title || "Video",
+    thumbnail: info.thumbnail || "",
+    duration: info.duration || 0,
+    mode,
+
+    downloadUrl: combinedStream?.url || null,
+    downloadHeaders: combinedStream?.headers || {},
+
+    videoUrl: videoStream?.url || null,
+    videoHeaders: videoStream?.headers || {},
+
+    audioUrl: audioStream?.url || null,
+    audioHeaders: audioStream?.headers || {}
+  };
 }
 
 app.get("/", (req, res) => {
   res.json({
-    app: "Velqora Downloader",
+    success: true,
+    message: "Velqora backend is running.",
+    platforms: ["youtube", "facebook", "instagram", "direct"]
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    success: true,
     status: "online"
   });
 });
 
+// Validate a video URL
 app.post("/validate", (req, res) => {
-  const { url } = req.body ?? {};
+  const { url } = req.body || {};
 
-  if (typeof url !== "string" || !url.trim()) {
+  if (!url || !isValidUrl(url)) {
     return res.status(400).json({
       valid: false,
       supported: false,
-      message: "Please provide a URL."
+      message: "Please enter a valid video URL."
     });
   }
 
-  let parsed;
+  const platform = detectPlatform(url);
 
-  try {
-    parsed = new URL(url.trim());
-
-    if (
-      !["http:", "https:"].includes(parsed.protocol) ||
-      !parsed.hostname ||
-      parsed.username ||
-      parsed.password
-    ) {
-      throw new Error("Invalid URL");
-    }
-  } catch {
+  if (!platform) {
     return res.status(400).json({
       valid: false,
       supported: false,
-      message: "Please enter a valid HTTP or HTTPS URL."
-    });
-  }
-
-  const platform = getPlatform(parsed);
-
-  if (platform !== "direct") {
-    return res.json({
-      valid: true,
-      supported: false,
-      platform,
-      message:
-        `${platform} links are recognized, but extraction must be tested separately.`
-    });
-  }
-
-  const path = parsed.pathname.toLowerCase();
-  const video = videoExtensions.some(ext => path.endsWith(ext));
-  const audio = audioExtensions.some(ext => path.endsWith(ext));
-
-  if (!video && !audio) {
-    return res.json({
-      valid: true,
-      supported: false,
-      platform: "direct",
-      message: "Use a direct video or audio file URL."
+      message: "Invalid URL."
     });
   }
 
   return res.json({
     valid: true,
     supported: true,
-    platform: "direct",
-    mediaType: video ? "video" : "audio",
-    message: "Direct media URL format recognized.",
-    downloadOptions: video ? ["video", "audio"] : ["audio"]
+    platform,
+    message: "URL accepted."
   });
 });
 
-app.post("/instagram-info", (req, res) => {
-  const { url } = req.body ?? {};
+// Main metadata and download information endpoint
+app.post("/media-info", async (req, res) => {
+  const { url } = req.body || {};
 
-  if (typeof url !== "string" || !isValidHttpUrl(url.trim())) {
+  if (!url || !isValidUrl(url)) {
     return res.status(400).json({
       success: false,
-      message: "Please provide a valid URL."
+      message: "Please enter a valid video URL."
     });
   }
 
-  const parsed = new URL(url.trim());
+  const platform = detectPlatform(url);
 
-  if (getPlatform(parsed) !== "instagram") {
+  if (!platform) {
     return res.status(400).json({
       success: false,
-      message: "Please provide an Instagram URL."
-    });
-  }
-
-  if (!/^\/(reel|reels|p|tv)\/[A-Za-z0-9_-]+\/?$/i.test(parsed.pathname)) {
-    return res.status(400).json({
-      success: false,
-      message: "Please provide a supported Instagram Reel or post URL."
+      message: "Unsupported URL."
     });
   }
 
   const now = Date.now();
+  const cooldownUntil = platformCooldowns.get(platform) || 0;
 
-  if (now < instagramCooldownUntil) {
-    const retryAfter = Math.ceil(
-      (instagramCooldownUntil - now) / 1000
+  if (now < cooldownUntil) {
+    const remainingSeconds = Math.ceil(
+      (cooldownUntil - now) / 1000
     );
 
     return res.status(429).json({
       success: false,
-      message: `Instagram is temporarily limiting requests. Please try again in ${retryAfter} seconds.`,
-      retry_after: retryAfter
+      platform,
+      message:
+        `This platform is temporarily unavailable. ` +
+        `Please try again in ${remainingSeconds} seconds.`
     });
   }
 
-  if (instagramRequestRunning) {
+  if (activeRequests.has(platform)) {
     return res.status(429).json({
       success: false,
-      message: "An Instagram request is already processing. Please try again shortly."
+      platform,
+      message: "Another request is being processed. Please try again shortly."
     });
   }
 
-  instagramRequestRunning = true;
+  activeRequests.add(platform);
 
-  execFile(
-    "python3",
-    [
-      "-m",
-      "yt_dlp",
+  try {
+    const args = [
       "--dump-single-json",
       "--no-warnings",
       "--no-playlist",
       "--no-download",
-      "--extractor-args",
-      "instagram:api=graphql",
       "--format",
       "bestvideo+bestaudio/best",
-      "--",
-      parsed.href
-    ],
-    {
-      timeout: 60000,
-      maxBuffer: 5 * 1024 * 1024
-    },
-    (error, stdout, stderr) => {
-      instagramRequestRunning = false;
+      "--extractor-retries",
+      "1"
+    ];
 
-      if (error) {
-        const errorText = String(stderr || error.message);
-
-        console.error("Instagram extraction failed:", errorText);
-
-        if (/HTTP Error 429|Too Many Requests|\b429\b/i.test(errorText)) {
-          instagramCooldownUntil = Date.now() + INSTAGRAM_COOLDOWN_MS;
-
-          return res.status(429).json({
-            success: false,
-            message: "Instagram is temporarily limiting requests. Please try again after 5 minutes.",
-            retry_after: 300
-          });
-        }
-
-        return res.status(502).json({
-          success: false,
-          message:
-            "Could not extract this Instagram media. It may be unavailable, private, or login-restricted."
-        });
-      }
-
-      try {
-        const info = JSON.parse(stdout);
-
-        const requestedFormats = Array.isArray(info.requested_formats)
-          ? info.requested_formats
-          : [];
-
-        let videoFormat = null;
-        let audioFormat = null;
-
-        if (requestedFormats.length >= 2) {
-          videoFormat = requestedFormats.find(hasVideo) || null;
-          audioFormat = requestedFormats.find(hasAudio) || null;
-        }
-
-        if (videoFormat && audioFormat) {
-          return res.json({
-            success: true,
-            platform: "instagram",
-            title: info.title || "Instagram video",
-            thumbnail: info.thumbnail || null,
-            mode: "separate",
-            videoUrl: videoFormat.url,
-            audioUrl: audioFormat.url,
-            videoHeaders: getHeaders(videoFormat, info),
-            audioHeaders: getHeaders(audioFormat, info),
-            extension: "mp4",
-            hasAudio: true,
-            hasVideo: true,
-            message: "Separate audio and video streams extracted."
-          });
-        }
-
-        const formats = Array.isArray(info.formats)
-          ? info.formats
-          : [];
-
-        const combinedFormats = formats
-          .filter(f => hasVideo(f) && hasAudio(f))
-          .sort((a, b) => {
-            return (
-              (b.height || 0) - (a.height || 0) ||
-              (b.tbr || 0) - (a.tbr || 0)
-            );
-          });
-
-        const combined =
-          hasVideo(info) && hasAudio(info)
-            ? info
-            : combinedFormats[0];
-
-        if (combined?.url) {
-          return res.json({
-            success: true,
-            platform: "instagram",
-            title: info.title || "Instagram video",
-            thumbnail: info.thumbnail || null,
-            mode: "combined",
-            downloadUrl: combined.url,
-            downloadHeaders: getHeaders(combined, info),
-            extension: combined.ext || "mp4",
-            hasAudio: true,
-            hasVideo: true,
-            message: "Combined audio and video stream extracted."
-          });
-        }
-
-        return res.status(502).json({
-          success: false,
-          message:
-            "No usable audio and video streams were found for this post."
-        });
-
-      } catch (parseError) {
-        console.error("Instagram JSON parsing failed:", parseError);
-
-        return res.status(502).json({
-          success: false,
-          message:
-            "The extraction service returned an unreadable response."
-        });
-      }
+    if (platform === "instagram") {
+      args.push(
+        "--extractor-args",
+        "instagram:api=graphql"
+      );
     }
-  );
+
+    args.push(url);
+
+    const info = await runYtDlp(args);
+    const result = getMediaResult(info, platform);
+
+    return res.json(result);
+  } catch (error) {
+    const message = getErrorMessage(error);
+
+    console.error(
+      `${platform} extraction failed:`,
+      message
+    );
+
+    if (isRateLimited(message)) {
+      platformCooldowns.set(
+        platform,
+        Date.now() + COOLDOWN_MS
+      );
+
+      return res.status(429).json({
+        success: false,
+        platform,
+        message:
+          "The platform is temporarily limiting requests. Please try again later."
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      platform,
+      message: "Unable to extract this video. It may be private, restricted, or temporarily unavailable."
+    });
+  } finally {
+    activeRequests.delete(platform);
+  }
 });
 
-const PORT = process.env.PORT || 3000;
+// Compatibility endpoints
+app.post("/youtube-info", (req, res) => {
+  req.url = "/media-info";
+  app.handle(req, res);
+});
 
-app.listen(PORT, "0.0.0.0", () => {
+app.post("/facebook-info", (req, res) => {
+  req.url = "/media-info";
+  app.handle(req, res);
+});
+
+app.post("/instagram-info", (req, res) => {
+  req.url = "/media-info";
+  app.handle(req, res);
+});
+
+app.listen(PORT, () => {
   console.log(`Velqora backend running on port ${PORT}`);
 });
