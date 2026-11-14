@@ -205,6 +205,8 @@ app.post("/instagram-info", (req, res) => {
       "--no-warnings",
       "--no-playlist",
       "--no-download",
+      "--extractor-args",
+      "instagram:api=graphql",
       "--format",
       "bestvideo+bestaudio/best",
       "--",
@@ -220,10 +222,7 @@ app.post("/instagram-info", (req, res) => {
       if (error) {
         const errorText = String(stderr || error.message);
 
-        console.error(
-          "Instagram extraction failed:",
-          errorText
-        );
+        console.error("Instagram extraction failed:", errorText);
 
         if (/HTTP Error 429|Too Many Requests|\b429\b/i.test(errorText)) {
           instagramCooldownUntil = Date.now() + INSTAGRAM_COOLDOWN_MS;
@@ -316,10 +315,7 @@ app.post("/instagram-info", (req, res) => {
         });
 
       } catch (parseError) {
-        console.error(
-          "Instagram JSON parsing failed:",
-          parseError
-        );
+        console.error("Instagram JSON parsing failed:", parseError);
 
         return res.status(502).json({
           success: false,
